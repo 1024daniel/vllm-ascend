@@ -366,6 +366,7 @@ def vllm_version_is(target_vllm_version: str):
 
         vllm_version = vllm.__version__
     try:
+        return Version('0.16.0') == Version(target_vllm_version)
         return Version(vllm_version) == Version(target_vllm_version)
     except InvalidVersion:
         raise ValueError(

@@ -1235,7 +1235,7 @@ class NPUModelRunner(GPUModelRunner):
                 ### inside or outside
                 if enable_lightning_indexer_skip():
                     li_reorder_indices, li_cum_query_lens, li_seq_lens, li_skiped_query_mask = get_sfa_skip_indices(
-                    self.input_batch.num_computed_tokens_cpu, num_scheduled_tokens
+                    self.input_batch.num_computed_tokens_cpu, tokens
                     )
 
                     if li_reorder_indices is not None:

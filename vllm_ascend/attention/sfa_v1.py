@@ -315,22 +315,22 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                 actual_seq_lengths_key=actual_seq_lengths_key,
             )
         top_k_indices_skip_li_query = None
-        if self.enable_lightning_indexer_skip and common_attn_metadata.li_skip_metadata is not None:
-            li_reorder_indices = common_attn_metadata.li_skip_metadata.li_reorder_indices
+        if self.enable_lightning_indexer_skip and common_attn_metadata.lightning_indexer_metadata is not None:
+            li_reorder_indices = common_attn_metadata.lightning_indexer_metadata.li_reorder_indices
             input_positions_pad = torch.zeros_like(input_positions)
             input_positions_pad[:num_actual_tokens] = torch.index_select(input_positions, 0, li_reorder_indices)
             slot_mapping_pad = torch.zeros_like(slot_mapping)
             slot_mapping_pad[:num_actual_tokens] = torch.index_select(slot_mapping, 0, li_reorder_indices)
 
-            cum_query_lens = common_attn_metadata.li_skip_metadata.li_cum_query_lens
-            seq_lens = common_attn_metadata.li_skip_metadata.li_seq_lens
-            li_skip_request_mask = common_attn_metadata.li_skip_metadata.li_skip_request_mask
+            cum_query_lens = common_attn_metadata.lightning_indexer_metadata.li_cum_query_lens
+            seq_lens = common_attn_metadata.lightning_indexer_metadata.li_seq_lens
+            li_skip_request_mask = common_attn_metadata.lightning_indexer_metadata.li_skip_request_mask
             common_attn_metadata.num_reqs = seq_lens.shape[0]
             block_table = torch.cat([block_table, block_table[li_skip_request_mask]], dim=0)
             slot_mapping = slot_mapping_pad
             input_positions = input_positions_pad
             cos, sin = get_cos_and_sin_mla(input_positions, True)
-            top_k_indices_skip_li_query = common_attn_metadata.li_skip_metadata.top_k_indices_of_skipped_queries
+            top_k_indices_skip_li_query = common_attn_metadata.lightning_indexer_metadata.top_k_indices_of_skipped_queries
 
         return self.metadata_cls(  # type: ignore
             num_input_tokens=common_attn_metadata.num_input_tokens,
