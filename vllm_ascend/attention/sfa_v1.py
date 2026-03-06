@@ -1050,10 +1050,22 @@ class AscendSFAImpl(MLAAttentionImpl):
         # TODO: torch.ops._C_ascend.npu_lightning_indexer needs to be removed.
         if self.enable_lightning_indexer_skip:
             if num_tokens > 0:
-                top_k_indices_no_skip_li_query = torch.ops._C_ascend.npu_lightning_indexer(
+                # top_k_indices_no_skip_li_query = torch.ops._C_ascend.npu_lightning_indexer(
+                #     query=q,
+                #     key=key,
+                #     weights=weights,
+                #     actual_seq_lengths_query=actual_seq_lengths_query[:num_seqs],
+                #     actual_seq_lengths_key=actual_seq_lengths_key[:num_seqs],
+                #     block_table=block_table[:num_seqs],
+                #     layout_query="TND",
+                #     layout_key="PA_BSND",
+                #     sparse_count=2048,
+                #     sparse_mode=3,
+                # )
+                top_k_indices_no_skip_li_query, _ = torch_npu.npu_lightning_indexer(
                     query=q,
-                    key=kv_cache[2],
-                                        weights=weights,
+                    key=key,
+                    weights=weights,
                     actual_seq_lengths_query=actual_seq_lengths_query[:num_seqs],
                     actual_seq_lengths_key=actual_seq_lengths_key[:num_seqs],
                     block_table=block_table[:num_seqs],
