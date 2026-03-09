@@ -34,6 +34,9 @@ from vllm_ascend.attention.utils import (
     trans_rope_weight,
     transdata,
     wait_for_kv_layer_from_connector,
+    get_sfa_skip_indices,
+    get_index_of_skipped_queries_numpy,
+    AscendLightningIndexerMetadata
 )
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.distributed.utils import all_gather_async
@@ -52,6 +55,7 @@ from vllm_ascend.utils import (
     dispose_layer,
     enable_dsa_cp,
     enable_dsa_cp_with_layer_shard,
+    enable_lightning_indexer_skip,
     enable_dsa_cp_with_o_proj_tp,
     get_weight_prefetch_method,
     maybe_trans_nz,
@@ -145,9 +149,14 @@ class AscendSFAMetadata:
     dsa_cp_context: DSACPContext | None = None
     reshape_cache_event: torch.npu.Event = None
     sfa_cp_metadata: AscendPCPMetadata | None = None
+    num_actual_seqs: int = 0
+    top_k_indices_skip_li_query: torch.Tensor | None = None
     num_decodes: int = 0
     num_decode_tokens: int = 0
     num_prefills: int = 0
+    
+    non_skip_num_actual_tokens: int = 1
+    skip: bool = False
 
 
 M = TypeVar("M", bound=AscendSFAMetadata)
@@ -198,6 +207,11 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         max_num_reqs = vllm_config.scheduler_config.max_num_seqs
         self.actual_seq_lengths_query = torch.zeros(max_num_reqs + 1, dtype=torch.int32, device=device)
         self.actual_seq_lengths_key = torch.empty_like(self.actual_seq_lengths_query)
+        
+        
+        self.enable_lightning_indexer_skip = enable_lightning_indexer_skip()
+        self.index_of_skipped_queries = None
+        self.num_actual_seqs = max_num_reqs
 
     @staticmethod
     def determine_chunked_prefill_workspace_size(vllm_config: VllmConfig) -> int:
@@ -233,18 +247,98 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
 
         cum_query_lens = common_attn_metadata.query_start_loc[1 : num_reqs + 1]
         seq_lens = common_attn_metadata.seq_lens[:num_reqs]
+        
+        my_query_start_loc = common_attn_metadata.query_start_loc[: num_reqs + 1]
+        tokens = my_query_start_loc[1:] - my_query_start_loc[:-1]
+        
+        # print(f'=================tokens in sfa build:{tokens})')
+       
 
         cos, sin = get_cos_and_sin_mla(input_positions, True)
 
+        # ====================================================================
+        # Step 1: lightning_indexer_skip
+        # Reorder the batch: non-skip tokens first, skip tokens appended as
+        # separate requests at the end. Updates cum_query_lens, seq_lens,
+        # block_table, slot_mapping, cos, sin.
+        # ====================================================================
+        num_of_non_skip_tokens = 0
+        top_k_indices_skip_li_query = None
+        skip = False
+        li_skip_query_lens = None  # used by dsa_cp to detect skip-aware path
+        top_k_indices_of_skipped_queries_numpy = None
+        if enable_lightning_indexer_skip():
+
+            (li_reorder_indices, li_cum_query_lens, li_seq_lens,
+             li_skiped_query_mask, num_of_non_skip_tokens,
+             li_skip_query_lens, li_no_skip_query_lens,
+             li_num_computed_tokens) = get_sfa_skip_indices(
+                seq_lens-tokens, tokens
+            )
+            skip = num_of_non_skip_tokens is not None
+
+            if li_reorder_indices is not None:
+                top_k_indices_of_skipped_queries_numpy = get_index_of_skipped_queries_numpy(
+                    li_cum_query_lens, li_seq_lens, num_reqs, 2048
+                )
+                common_attn_metadata.lightning_indexer_metadata = AscendLightningIndexerMetadata(
+                                                li_reorder_indices=torch.from_numpy(li_reorder_indices)
+                    .pin_memory()
+                    .to(dtype=torch.int32, device=self.device, non_blocking=True),
+                    li_cum_query_lens=torch.from_numpy(li_cum_query_lens)
+                    .pin_memory()
+                    .to(dtype=torch.int32, device=self.device, non_blocking=True),
+                    li_seq_lens=torch.from_numpy(li_seq_lens)
+                    .pin_memory()
+                    .to(dtype=torch.int32, device=self.device, non_blocking=True),
+                    li_skip_request_mask=torch.from_numpy(li_skiped_query_mask)
+                    .pin_memory()
+                    .to(dtype=torch.bool, device=self.device, non_blocking=True),
+                    # top_k_indices_of_skipped_queries=torch.from_numpy(top_k_indices_of_skipped_queries_numpy)
+                    # .pin_memory()
+                    # .to(dtype=torch.int32, device=self.device, non_blocking=True),
+                    # num_of_non_skip_tokens = num_of_non_skip_tokens
+                )
+                li_reorder_indices = common_attn_metadata.lightning_indexer_metadata.li_reorder_indices
+                input_positions_pad = torch.zeros_like(input_positions)
+                input_positions_pad[:num_actual_tokens] = torch.index_select(input_positions, 0, li_reorder_indices)
+                slot_mapping_pad = torch.zeros_like(slot_mapping)
+                slot_mapping_pad[:num_actual_tokens] = torch.index_select(slot_mapping, 0, li_reorder_indices)
+
+                cum_query_lens = common_attn_metadata.lightning_indexer_metadata.li_cum_query_lens
+                seq_lens = common_attn_metadata.lightning_indexer_metadata.li_seq_lens
+                li_skip_request_mask = common_attn_metadata.lightning_indexer_metadata.li_skip_request_mask
+                # common_attn_metadata.num_reqs = seq_lens.shape[0]
+                block_table = torch.cat([block_table, block_table[li_skip_request_mask]], dim=0)
+                slot_mapping = slot_mapping_pad
+                input_positions = input_positions_pad
+                cos, sin = get_cos_and_sin_mla(input_positions, True)
+                # top_k_indices_skip_li_query = common_attn_metadata.lightning_indexer_metadata.top_k_indices_of_skipped_queries
+
+        # ====================================================================
+        # Step 2: dsa_cp
+        # Split tokens evenly across TP devices, recompute per-device
+        # actual_seq_lengths_query and actual_seq_lengths_key.
+        # When combined with lightning_indexer_skip, operates on the
+        # already-reordered cum_query_lens/seq_lens and uses skip-aware
+        # key_lens computation.
+        # ====================================================================
         dsa_cp_context = None
+        num_non_skip_tokens_local = 0
         if self.enable_dsa_cp:
+            num_segs_for_cp = cum_query_lens.shape[0]
+
             global_tp_size = get_tp_group().world_size
             num_tokens = num_input_tokens
             num_tokens_pad = _round_up(num_tokens, global_tp_size)
             num_tokens_per_device = num_tokens_pad // global_tp_size
             local_start = get_tp_group().rank_in_group * num_tokens_per_device
+           
             local_end_with_pad = local_start + num_tokens_per_device
             local_end = min(local_end_with_pad, num_actual_tokens)
+            print(f'00000000000000 local_start:{local_start}, num_tokens_per_device:{num_tokens_per_device}, num_actual_tokens:{num_actual_tokens}')
+
+            # print(f'==========num_input_tokens:{num_input_tokens}==num_actual_tokens:{num_actual_tokens}')
 
             pad_size = num_tokens_pad - cos.shape[0]
             assert cos.shape == sin.shape, f"cos.shape must be equal to sin.shape, got {cos.shape} and {sin.shape}"
@@ -262,6 +356,8 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
 
             cos = cos[local_start:local_end_with_pad]
             sin = sin[local_start:local_end_with_pad]
+            
+            # top_k_indices_of_skipped_queries_numpy = top_k_indices_of_skipped_queries_numpy[local_start:local_end_with_pad] if top_k_indices_of_skipped_queries_numpy is not None else None
 
             assert cos.shape[0] == num_tokens_per_device, (
                 f"cos.shape[0] must be equal to num_tokens_per_device, \
@@ -276,13 +372,39 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                     got {slot_mapping.shape[0]} and {num_tokens_pad}"
             )
 
-            actual_seq_lengths_query = self.actual_seq_lengths_query
-            actual_seq_lengths_key = self.actual_seq_lengths_key
+            # actual_seq_lengths_query = self.actual_seq_lengths_query
+            # actual_seq_lengths_key = self.actual_seq_lengths_key
+            if common_attn_metadata.lightning_indexer_metadata is not None:
+                actual_seq_lengths_query = common_attn_metadata.lightning_indexer_metadata.li_cum_query_lens
+                actual_seq_lengths_key = common_attn_metadata.lightning_indexer_metadata.li_seq_lens
+            else:
+                actual_seq_lengths_query = self.actual_seq_lengths_query
+                actual_seq_lengths_key = self.actual_seq_lengths_key
+            import numpy as np
+            seg_is_skip = np.zeros(num_segs_for_cp, dtype=bool)
+            seg_is_skip[num_reqs:] = True
+            # local_non_skip_tokens = actual_seq_lengths_query[num_reqs-1]
+            # for i in num_segs_for_cp:
+            #     if not seg_is_skip[i]:
+            #         local_non_skip_tokens += 
+            
 
-            num_segs = cum_query_lens.shape[0]
+            # Build segment-to-request mapping when skip is active
+            # has_skip_info = li_skip_query_lens is not None
+            # if has_skip_info:
+            #     import numpy as np
+            #     _mask = li_skiped_query_mask.cpu().numpy() if isinstance(li_skiped_query_mask, torch.Tensor) else li_skiped_query_mask
+            #     skip_req_indices = np.where(_mask)[0]
+            #     seg_to_req = np.concatenate([np.arange(num_reqs), skip_req_indices])
+            #     seg_is_skip = np.zeros(num_segs_for_cp, dtype=bool)
+            #     seg_is_skip[num_reqs:] = True
+                
+
             last_token = 0
             cum = 0
-            for i in range(0, num_segs):
+
+            # print(f'0000000000000000cum_query_lens:{cum_query_lens}, num_segs_for_cp:{num_segs_for_cp}', flush= True)
+            for i in range(0, num_segs_for_cp):
                 global_start = last_token
                 global_end = cum_query_lens[i].item()
                 last_token = global_end
@@ -290,19 +412,48 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                 req_local_start = max(global_start, local_start)
                 req_local_end = min(global_end, local_end_with_pad)
                 num_local_tokens = req_local_end - req_local_start
+                
+                if not seg_is_skip[i] and num_local_tokens > 0:
+                    num_non_skip_tokens_local += num_local_tokens
+                # print(f'==========num_non_skip_tokens_local:{num_non_skip_tokens_local}')
 
                 if num_local_tokens > 0:
                     cum += num_local_tokens
                     actual_seq_lengths_query[i] = cum
 
+                    # if has_skip_info:
+                    #     r = int(seg_to_req[i])
+                    #     tokens_on_prev_devices = max(0, local_start - global_start)
+                    #     if not seg_is_skip[i]:
+                    #         # noskip segment sees: computed + skip_part + prev_noskip + local_noskip
+                    #         actual_seq_lengths_key[i] = (
+                    #             int(li_num_computed_tokens[r])
+                    #             + int(li_skip_query_lens[r])
+                    #             + tokens_on_prev_devices
+                    #             + num_local_tokens
+                    #         )
+                    #     else:
+                    #         # skip segment sees: computed + prev_skip + local_skip
+                    #         actual_seq_lengths_key[i] = (
+                    #             int(li_num_computed_tokens[r])
+                    #             + tokens_on_prev_devices
+                    #             + num_local_tokens
+                    #         )
+                    # else:
+                        # Original dsa_cp logic (no skip)
                     offset = global_end - req_local_end
                     actual_seq_lengths_key[i] = seq_lens[i].item() - offset
                 else:
                     actual_seq_lengths_query[i] = cum
                     actual_seq_lengths_key[i] = 0
 
-            actual_seq_lengths_query = actual_seq_lengths_query[:num_reqs]
-            actual_seq_lengths_key = actual_seq_lengths_key[:num_reqs]
+            actual_seq_lengths_query = actual_seq_lengths_query[:num_segs_for_cp]
+            actual_seq_lengths_key = actual_seq_lengths_key[:num_segs_for_cp]
+
+
+            # print(f'===============actual_seq_lengths_query:{actual_seq_lengths_query}===============', flush = True)
+            # print(f'===============actual_seq_lengths_key:{actual_seq_lengths_key}===============', flush = True)
+            # print(f'========================num_segs_for_cp:{num_segs_for_cp}============', flush=True)
 
             dsa_cp_context = DSACPContext(
                 num_tokens=num_tokens,
@@ -314,6 +465,11 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                 actual_seq_lengths_query=actual_seq_lengths_query,
                 actual_seq_lengths_key=actual_seq_lengths_key,
             )
+        if enable_lightning_indexer_skip() and self.enable_dsa_cp:
+            top_k_indices_of_skipped_queries_numpy = get_index_of_skipped_queries_numpy(
+                actual_seq_lengths_query, actual_seq_lengths_key, num_reqs, 2048
+            )
+        top_k_indices_of_skipped_queries_numpy = torch.from_numpy(top_k_indices_of_skipped_queries_numpy).pin_memory().to(dtype=torch.int32, device=self.device, non_blocking=True) if top_k_indices_of_skipped_queries_numpy is not None else None
 
         return self.metadata_cls(  # type: ignore
             num_input_tokens=common_attn_metadata.num_input_tokens,
@@ -328,6 +484,10 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             sin=sin[:num_input_tokens],
             cos=cos[:num_input_tokens],
             dsa_cp_context=dsa_cp_context,
+            num_actual_seqs = num_reqs,
+            top_k_indices_skip_li_query = top_k_indices_of_skipped_queries_numpy,
+            non_skip_num_actual_tokens = num_non_skip_tokens_local,
+            skip = skip
         )
 
     def build_for_graph_capture(
@@ -434,6 +594,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         if self.use_sparse_c8_indexer:
             self.c8_k_cache_dtype = torch.int8
             self.c8_k_scale_cache_dtype = torch.float16
+        self.enable_lightning_indexer_skip = enable_lightning_indexer_skip()
 
         # Effective in SFA when FlashComm is enabled.
         self.enable_dsa_cp = enable_dsa_cp()
@@ -910,37 +1071,77 @@ class AscendSFAImpl(MLAAttentionImpl):
         actual_seq_lengths_query: torch.Tensor,
         actual_seq_lengths_key: torch.Tensor,
     ):
-        weights, _ = self.weights_proj(x)
+        sparse_count = 2048
 
-        q_li, _ = self.wq_b(q_c)  # [b,s,1536] @ [1536,64*128] = [b,s,64*128]
-        q_li = q_li.view(-1, self.n_head, self.head_dim)  # [n_toks,64,128]
-        if HAS_TRITON:
-            q_li = rope_forward_triton_siso(
-                q_li, cos, sin, rope_dim=self.qk_rope_head_dim, is_neox_style=self.is_rope_neox_style
-            )
+        # =========================
+        # step1: determine token range
+        # =========================
+        if attn_metadata.skip:
+            num_tokens = attn_metadata.non_skip_num_actual_tokens
+            if num_tokens > 0:
+                x = x[:num_tokens]
+                q_c = q_c[:num_tokens]
+                cos = cos[:num_tokens]
+                sin = sin[:num_tokens]
         else:
-            q_li_pe, q_li_nope = torch.split(
-                q_li, [self.qk_rope_head_dim, self.head_dim - self.qk_rope_head_dim], dim=-1
-            )  # [b,s,64,64+64]
+            num_tokens = x.shape[0]
+        # print(f'==============attn_metadata.num_actual_seqs:{attn_metadata.num_actual_seqs}',flush=True)
+        # print(f'==========num_tokens:{num_tokens}',flush= True)
 
-            q_li_pe = q_li_pe.unsqueeze(2)
-            q_li_pe = torch_npu.npu_rotary_mul(q_li_pe, cos, sin)
-            q_li_pe = q_li_pe.squeeze(2)
-            q_li = torch.cat([q_li_pe, q_li_nope], dim=-1)  # [b*s,64,128]
+        # =========================
+        # step2: compute weights + q_li
+        # =========================
+        if num_tokens > 0:
+            if self.use_sparse_c8_indexer:
+                q_li_shape_ori = q_li.shape
+                q_li = q_li @ AscendSFAImpl.qk_hadamard
+                q_li, q_li_scale = torch_npu.npu_dynamic_quant(q_li.view(-1, self.head_dim), dst_type=self.c8_k_cache_dtype)
+                q_li_scale = q_li_scale.to(self.c8_k_scale_cache_dtype)
+            else:
+                weights, _ = self.weights_proj(x)
+                q_li, _ = self.wq_b(q_c) # [b,s,1536] @ [1536,64*128] = [b,s,64*128]
+                q_li = q_li.view(-1, self.n_head, self.head_dim) # [n_toks,64,128]
 
-        if self.use_sparse_c8_indexer:
-            q_li_shape_ori = q_li.shape
-            q_li = q_li @ AscendSFAImpl.qk_hadamard
-            q_li, q_li_scale = torch_npu.npu_dynamic_quant(q_li.view(-1, self.head_dim), dst_type=self.c8_k_cache_dtype)
-            q_li_scale = q_li_scale.to(self.c8_k_scale_cache_dtype)
+                # rope
+                if HAS_TRITON:
+                    q_li = rope_forward_triton_siso(
+                        q_li,
+                        cos,
+                        sin,
+                        rope_dim=self.qk_rope_head_dim,
+                        is_neox_style=self.is_rope_neox_style,
+                    )
+                else:
+                    q_li_pe, q_li_nope = torch.split(
+                        q_li,
+                        [self.qk_rope_head_dim, self.head_dim - self.qk_rope_head_dim],
+                        dim=-1,
+                    ) # [b,s,64,64+64]
 
+                    q_li_pe = torch_npu.npu_rotary_mul(
+                        q_li_pe.unsqueeze(2),
+                        cos,
+                        sin,
+                    ).squeeze(2)
+
+                    q_li = torch.cat([q_li_pe, q_li_nope], dim=-1) # [b*s,64,128]
+
+        # =========================
+        # step3: run lightning indexer
+        # =========================
         # DSV3.2 currently has graph compilation issues when using torch_npu.npu.lightning_indexer.
         # So two branches are maintained temporarily.
         # TODO: torch.ops._C_ascend.npu_lightning_indexer needs to be removed.
-        if self.use_sparse_c8_indexer:
+        if attn_metadata.skip and num_tokens == 0:
+            top_k_indices_no_skip_li_query = torch.empty(
+                (0, 1, sparse_count),
+                device=x.device,
+                dtype=torch.int32,
+            )
+        elif self.use_sparse_c8_indexer:
             assert len(kv_cache) == 4
             weights = weights.to(torch.float16)
-            topk_indices = torch.ops._C_ascend.npu_lightning_indexer_quant(
+            top_k_indices_no_skip_li_query = torch.ops._C_ascend.npu_lightning_indexer_quant(
                 query=q_li.view(q_li_shape_ori),
                 key=kv_cache[2],
                 weights=weights,
@@ -957,32 +1158,56 @@ class AscendSFAImpl(MLAAttentionImpl):
                 sparse_mode=3,
             )
         elif self.use_torch_npu_lightning_indexer:
-            topk_indices, _ = torch_npu.npu_lightning_indexer(
+            top_k_indices_no_skip_li_query, _ = torch_npu.npu_lightning_indexer(
                 query=q_li,
                 key=kv_cache[2],
                 weights=weights,
-                actual_seq_lengths_query=actual_seq_lengths_query,
-                actual_seq_lengths_key=actual_seq_lengths_key,
-                block_table=attn_metadata.block_table,
+                actual_seq_lengths_query=actual_seq_lengths_query[:attn_metadata.num_actual_seqs],
+                actual_seq_lengths_key=actual_seq_lengths_key[:attn_metadata.num_actual_seqs],
+                block_table=attn_metadata.block_table[:attn_metadata.num_actual_seqs],
                 layout_query="TND",
                 layout_key="PA_BSND",
-                sparse_count=2048,
+                sparse_count=sparse_count,
                 sparse_mode=3,
             )
         else:
-            topk_indices = torch.ops._C_ascend.npu_lightning_indexer(
+            top_k_indices_no_skip_li_query = torch.ops._C_ascend.npu_lightning_indexer(
                 query=q_li,
                 key=kv_cache[2],
                 weights=weights,
-                actual_seq_lengths_query=actual_seq_lengths_query,
-                actual_seq_lengths_key=actual_seq_lengths_key,
-                block_table=attn_metadata.block_table,
+                actual_seq_lengths_query=actual_seq_lengths_query[:attn_metadata.num_actual_seqs],
+                actual_seq_lengths_key=actual_seq_lengths_key[:attn_metadata.num_actual_seqs],
+                block_table=attn_metadata.block_table[:attn_metadata.num_actual_seqs],
                 layout_query="TND",
                 layout_key="PA_BSND",
-                sparse_count=2048,
+                sparse_count=sparse_count,
                 sparse_mode=3,
             )
-        return topk_indices
+
+        # concat skipped sequences
+        if attn_metadata.num_actual_seqs != actual_seq_lengths_key.shape[0]:
+            # print(f'=========metadata.top_k_indices_skip_li_query:{attn_metadata.top_k_indices_skip_li_query}')
+            top_k_indices = torch.cat(
+                [top_k_indices_no_skip_li_query, attn_metadata.top_k_indices_skip_li_query],
+                dim=0,
+            )
+        else:
+            top_k_indices = top_k_indices_no_skip_li_query
+
+        # pad
+        # pad_size = attn_metadata.num_input_tokens - top_k_indices.shape[0]
+        pad_size = actual_seq_lengths_query[-1] - top_k_indices.shape[0]
+        # print(f'=========pad_size:{pad_size}')
+        if pad_size > 0:
+            indices_pad = torch.full(
+                (pad_size, 1, sparse_count),
+                -1,
+                device=top_k_indices.device,
+                dtype=torch.int32,
+            )
+            top_k_indices = torch.cat([top_k_indices, indices_pad], dim=0)
+        # print(f'==========top_indices shape:{top_k_indices.shape}', flush = True)
+        return top_k_indices
 
     def _execute_sparse_flash_attention_process(
         self, ql_nope, q_pe, kv_cache, topk_indices, attn_metadata, actual_seq_lengths_query, actual_seq_lengths_key
@@ -1196,6 +1421,20 @@ class AscendSFAImpl(MLAAttentionImpl):
             actual_seq_lengths_query=actual_seq_lengths_query,
             actual_seq_lengths_key=actual_seq_lengths_key,
         )
+
+        # dsa_cp mode: ql_nope/q_pe have num_tokens_per_device positions (including
+        # pad), but the skip path in indexer_select_post_process may produce fewer
+        # rows (only covering real tokens). Pad topk_indices with -1 so that its
+        # first dimension matches the query tensors — the pad positions are masked
+        # out by actual_seq_lengths_query anyway.
+        if topk_indices.shape[0] < ql_nope.shape[0]:
+            pad_count = ql_nope.shape[0] - topk_indices.shape[0]
+            topk_indices = torch.cat(
+                [topk_indices,
+                 torch.full((pad_count, topk_indices.shape[1], topk_indices.shape[2]),
+                            -1, device=topk_indices.device, dtype=topk_indices.dtype)],
+                dim=0,
+            )
 
         attn_output = self._execute_sparse_flash_attention_process(
             ql_nope, q_pe, kv_cache, topk_indices, attn_metadata, actual_seq_lengths_query, actual_seq_lengths_key
