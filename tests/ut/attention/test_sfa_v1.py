@@ -197,10 +197,12 @@ class TestAscendSFAMetadataBuilder(TestBase):
         common_attn_metadata = MagicMock()
         common_attn_metadata.num_reqs = 10
         common_attn_metadata.num_actual_tokens = 100
+        common_attn_metadata.seq_lens = torch.Tensor(
+            [100]*common_attn_metadata.num_reqs)
         common_attn_metadata.query_start_loc = torch.tensor(
-            [0, 10, 20, 30, 40, 50, 60, 70, 80, 90])
+            [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100])
         common_attn_metadata.query_start_loc_cpu = torch.tensor(
-            [0, 10, 20, 30, 40, 50, 60, 70, 80, 90])
+            [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100])
         common_attn_metadata.slot_mapping = torch.randn(100, 4, 1024)
         common_attn_metadata.seq_lens_cpu = torch.tensor([2] * 10)
         common_attn_metadata.positions = torch.randn(100)
@@ -255,10 +257,12 @@ class TestAscendSFAMetadataBuilder(TestBase):
         common_attn_metadata = MagicMock()
         common_attn_metadata.num_reqs = 10
         common_attn_metadata.num_actual_tokens = 100
+        common_attn_metadata.seq_lens = torch.Tensor(
+            [100]*common_attn_metadata.num_reqs)
         common_attn_metadata.query_start_loc = torch.tensor(
-            [0, 10, 20, 30, 40, 50, 60, 70, 80, 90])
+            [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100])
         common_attn_metadata.query_start_loc_cpu = torch.tensor(
-            [0, 10, 20, 30, 40, 50, 60, 70, 80, 90])
+            [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100])
         common_attn_metadata.slot_mapping = torch.randn(100, 4, 1024)
         common_attn_metadata.seq_lens_cpu = torch.tensor([2] * 10)
         common_attn_metadata.positions = torch.randn(100)
