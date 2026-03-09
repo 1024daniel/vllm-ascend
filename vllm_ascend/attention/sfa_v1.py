@@ -355,7 +355,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             dsa_cp_context=dsa_cp_context,
             num_actual_seqs = num_reqs,
             top_k_indices_skip_li_query = top_k_indices_skip_li_query,
-            non_skip_num_actual_tokens = cum_query_lens[num_reqs-1]
+            non_skip_num_actual_tokens = cum_query_lens[num_reqs-1],
             skip = skip
         )
 
@@ -919,16 +919,11 @@ class AscendSFAImpl(MLAAttentionImpl):
         actual_seq_lengths_query: torch.Tensor,
         actual_seq_lengths_key: torch.Tensor,
     ):
-        if attn_metadata.skip:
-            num_seqs = attn_metadata.num_actual_seqs
-            num_tokens = attn_metadata.non_skip_num_actual_tokens
-            x = x[:num_tokens]
-            q = q[:num_tokens] if q is not None else q
-            qr = qr[:num_tokens]
         weights, _ = self.weights_proj(x)
 
         q_li, _ = self.wq_b(q_c)  # [b,s,1536] @ [1536,64*128] = [b,s,64*128]
         q_li = q_li.view(-1, self.n_head, self.head_dim)  # [n_toks,64,128]
+        
         if HAS_TRITON:
             q_li = rope_forward_triton_siso(
                 q_li, cos, sin, rope_dim=self.qk_rope_head_dim, is_neox_style=self.is_rope_neox_style
@@ -943,13 +938,19 @@ class AscendSFAImpl(MLAAttentionImpl):
             q_li_pe = q_li_pe.squeeze(2)
             q_li = torch.cat([q_li_pe, q_li_nope], dim=-1)  # [b*s,64,128]
 
+        if attn_metadata.skip:
+            num_seqs = attn_metadata.num_actual_seqs
+            num_tokens = attn_metadata.non_skip_num_actual_tokens
+            x = x[:num_tokens]
+            q_li = q_li[:num_tokens]
+
         # DSV3.2 currently has graph compilation issues when using torch_npu.npu.lightning_indexer.
         # So two branches are maintained temporarily.
         # TODO: torch.ops._C_ascend.npu_lightning_indexer needs to be removed.
         if attn_metadata.skip:
             if num_tokens > 0:
                 top_k_indices_no_skip_li_query, _ = torch_npu.npu_lightning_indexer(
-                    query=q,
+                    query=q_li,
                     key=kv_cache[2],
                     weights=weights,
                     actual_seq_lengths_query=actual_seq_lengths_query[:num_seqs],
@@ -961,7 +962,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                     sparse_mode=3,
                 )
             else:
-                top_k_indices_no_skip_li_query = torch.empty((0, 1, 2048), device=q.device, dtype=torch.int32)
+                top_k_indices_no_skip_li_query = torch.empty((0, 1, 2048), device=q_li.device, dtype=torch.int32)
 
             if attn_metadata.num_actual_seqs != actual_seq_lengths_key.shape[0]:
                 top_k_indices_skip_li_query = attn_metadata.top_k_indices_skip_li_query
