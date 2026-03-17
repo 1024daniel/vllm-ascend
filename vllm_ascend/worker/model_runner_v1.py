@@ -1221,7 +1221,7 @@ class NPUModelRunner(GPUModelRunner):
                 
                 ### inside or outside
                 if enable_lightning_indexer_skip():
-                    li_reorder_indices, li_cum_query_lens, li_seq_lens, li_skiped_query_mask = get_sfa_skip_indices(
+                    li_reorder_indices, li_cum_query_lens, li_seq_lens, li_skiped_query_mask, num_of_non_skip_tokens = get_sfa_skip_indices(
                     self.input_batch.num_computed_tokens_cpu, tokens
                     )
 
@@ -1246,6 +1246,7 @@ class NPUModelRunner(GPUModelRunner):
                             top_k_indices_of_skipped_queries=torch.from_numpy(top_k_indices_of_skipped_queries_numpy)
                             .pin_memory()
                             .to(dtype=torch.int32, device=self.device, non_blocking=True),
+                            num_of_non_skip_tokens = num_of_non_skip_tokens
                         )
                     else:
                         self.lightning_indexer_metadata = None
