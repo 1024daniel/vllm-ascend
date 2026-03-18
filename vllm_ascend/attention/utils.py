@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Any
+import numpy as np
 
 import torch
 import torch.nn.functional as F
@@ -342,12 +343,19 @@ def enabling_mlapo(vllm_config: VllmConfig) -> bool:
     )
     return bool(envs.VLLM_ASCEND_ENABLE_MLAPO and is_decode_instance)
 
+def to_numpy(x):
+    if isinstance(x, torch.Tensor):
+        return x.cpu().numpy()
+    return x
+
 def get_sfa_skip_indices(num_comptuted_tokens, query_lens):
-    import numpy as np
+    num_comptuted_tokens = to_numpy(num_comptuted_tokens)
+    query_lens = to_numpy(query_lens)
+    skip_threold = 2048
 
     # calculate num of tokens need skip for each request
     num_comptuted_tokens = num_comptuted_tokens[: len(query_lens)]
-    num_skip_tokens = np.maximum(2048 - num_comptuted_tokens, 0)
+    num_skip_tokens = np.maximum(skip_threold - num_comptuted_tokens, 0)
     skip_query_lens = np.minimum(num_skip_tokens, query_lens)
     # if no request is skipped, return None
     if np.sum(num_skip_tokens) == 0:
@@ -402,6 +410,9 @@ def get_sfa_skip_indices(num_comptuted_tokens, query_lens):
 
 
 def get_index_of_skipped_queries_numpy(actual_seq_lengths_query, actual_seq_lengths_key, num_actual_seqs, sparse_count):
+    actual_seq_lengths_query = to_numpy(actual_seq_lengths_query)
+    actual_seq_lengths_key = to_numpy(actual_seq_lengths_key)
+    num_actual_seqs = to_numpy(num_actual_seqs)
     import numpy as np
 
     # 2. calculate each seq's length

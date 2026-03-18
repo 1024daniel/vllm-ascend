@@ -1218,39 +1218,6 @@ class NPUModelRunner(GPUModelRunner):
 
                 use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
                 ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
-                
-                ### inside or outside
-                if enable_lightning_indexer_skip():
-                    li_reorder_indices, li_cum_query_lens, li_seq_lens, li_skiped_query_mask, num_of_non_skip_tokens = get_sfa_skip_indices(
-                    self.input_batch.num_computed_tokens_cpu, tokens
-                    )
-
-                    if li_reorder_indices is not None:
-                        top_k_indices_of_skipped_queries_numpy = get_index_of_skipped_queries_numpy(
-                            li_cum_query_lens, li_seq_lens, num_reqs, 2048
-                        )
-                        # make lighting skip metadata
-                        self.lightning_indexer_metadata = AscendLightningIndexerMetadata(
-                                                        li_reorder_indices=torch.from_numpy(li_reorder_indices)
-                            .pin_memory()
-                            .to(dtype=torch.int32, device=self.device, non_blocking=True),
-                            li_cum_query_lens=torch.from_numpy(li_cum_query_lens)
-                            .pin_memory()
-                            .to(dtype=torch.int32, device=self.device, non_blocking=True),
-                            li_seq_lens=torch.from_numpy(li_seq_lens)
-                            .pin_memory()
-                            .to(dtype=torch.int32, device=self.device, non_blocking=True),
-                            li_skip_request_mask=torch.from_numpy(li_skiped_query_mask)
-                            .pin_memory()
-                            .to(dtype=torch.bool, device=self.device, non_blocking=True),
-                            top_k_indices_of_skipped_queries=torch.from_numpy(top_k_indices_of_skipped_queries_numpy)
-                            .pin_memory()
-                            .to(dtype=torch.int32, device=self.device, non_blocking=True),
-                            num_of_non_skip_tokens = num_of_non_skip_tokens
-                        )
-                    else:
-                        self.lightning_indexer_metadata = None
-
                 if (
                     cudagraph_mode == CUDAGraphMode.FULL
                     or (enable_sp() and not self.model_config.use_mla)
