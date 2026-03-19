@@ -1317,6 +1317,7 @@ class NPUModelRunner(GPUModelRunner):
                 ),
                 self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
             ):
+                print(f'===========input ids len:{input_ids.shape}', flush = True)
                 if enable_lightning_indexer_skip() and self.lightning_indexer_metadata is not None:
                     input_ids, positions = maybe_pad_and_reorder_inputs(
                     input_ids, positions, self.lightning_indexer_metadata.li_reorder_indices
