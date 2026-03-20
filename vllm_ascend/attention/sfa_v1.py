@@ -261,6 +261,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         top_k_indices_skip_li_query = None
         skip = False
         li_skip_query_lens = None  # used by dsa_cp to detect skip-aware path
+        top_k_indices_of_skipped_queries_numpy = None
         if enable_lightning_indexer_skip():
 
             (li_reorder_indices, li_cum_query_lens, li_seq_lens,
@@ -272,9 +273,9 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             skip = num_of_non_skip_tokens is not None
 
             if li_reorder_indices is not None:
-                # top_k_indices_of_skipped_queries_numpy = get_index_of_skipped_queries_numpy(
-                #     li_cum_query_lens, li_seq_lens, num_reqs, 2048
-                # )
+                top_k_indices_of_skipped_queries_numpy = get_index_of_skipped_queries_numpy(
+                    li_cum_query_lens, li_seq_lens, num_reqs, 2048
+                )
                 common_attn_metadata.lightning_indexer_metadata = AscendLightningIndexerMetadata(
                                                 li_reorder_indices=torch.from_numpy(li_reorder_indices)
                     .pin_memory()
@@ -291,7 +292,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                     # top_k_indices_of_skipped_queries=torch.from_numpy(top_k_indices_of_skipped_queries_numpy)
                     # .pin_memory()
                     # .to(dtype=torch.int32, device=self.device, non_blocking=True),
-                    num_of_non_skip_tokens = num_of_non_skip_tokens
+                    # num_of_non_skip_tokens = num_of_non_skip_tokens
                 )
                 li_reorder_indices = common_attn_metadata.lightning_indexer_metadata.li_reorder_indices
                 input_positions_pad = torch.zeros_like(input_positions)
@@ -326,8 +327,12 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             num_tokens_pad = _round_up(num_tokens, global_tp_size)
             num_tokens_per_device = num_tokens_pad // global_tp_size
             local_start = get_tp_group().rank_in_group * num_tokens_per_device
+           
             local_end_with_pad = local_start + num_tokens_per_device
             local_end = min(local_end_with_pad, num_actual_tokens)
+            print(f'00000000000000 local_start:{local_start}, num_tokens_per_device:{num_tokens_per_device}, num_actual_tokens:{num_actual_tokens}')
+
+            # print(f'==========num_input_tokens:{num_input_tokens}==num_actual_tokens:{num_actual_tokens}')
 
             pad_size = num_tokens_pad - cos.shape[0]
             assert cos.shape == sin.shape, f"cos.shape must be equal to sin.shape, got {cos.shape} and {sin.shape}"
@@ -345,6 +350,8 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
 
             cos = cos[local_start:local_end_with_pad]
             sin = sin[local_start:local_end_with_pad]
+            
+            top_k_indices_of_skipped_queries_numpy = top_k_indices_of_skipped_queries_numpy[local_start:local_end_with_pad] if top_k_indices_of_skipped_queries_numpy is not None else None
 
             assert cos.shape[0] == num_tokens_per_device, (
                 f"cos.shape[0] must be equal to num_tokens_per_device, \
@@ -361,19 +368,30 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
 
             actual_seq_lengths_query = self.actual_seq_lengths_query
             actual_seq_lengths_key = self.actual_seq_lengths_key
+            import numpy as np
+            seg_is_skip = np.zeros(num_segs_for_cp, dtype=bool)
+            seg_is_skip[num_reqs:] = True
+            # local_non_skip_tokens = actual_seq_lengths_query[num_reqs-1]
+            # for i in num_segs_for_cp:
+            #     if not seg_is_skip[i]:
+            #         local_non_skip_tokens += 
+            
 
             # Build segment-to-request mapping when skip is active
-            has_skip_info = li_skip_query_lens is not None
-            if has_skip_info:
-                import numpy as np
-                _mask = li_skiped_query_mask.cpu().numpy() if isinstance(li_skiped_query_mask, torch.Tensor) else li_skiped_query_mask
-                skip_req_indices = np.where(_mask)[0]
-                seg_to_req = np.concatenate([np.arange(num_reqs), skip_req_indices])
-                seg_is_skip = np.zeros(num_segs_for_cp, dtype=bool)
-                seg_is_skip[num_reqs:] = True
+            # has_skip_info = li_skip_query_lens is not None
+            # if has_skip_info:
+            #     import numpy as np
+            #     _mask = li_skiped_query_mask.cpu().numpy() if isinstance(li_skiped_query_mask, torch.Tensor) else li_skiped_query_mask
+            #     skip_req_indices = np.where(_mask)[0]
+            #     seg_to_req = np.concatenate([np.arange(num_reqs), skip_req_indices])
+            #     seg_is_skip = np.zeros(num_segs_for_cp, dtype=bool)
+            #     seg_is_skip[num_reqs:] = True
+                
 
             last_token = 0
             cum = 0
+            num_non_skip_tokens_local = 0
+            print(f'0000000000000000cum_query_lens:{cum_query_lens}, num_segs_for_cp:{num_segs_for_cp}', flush= True)
             for i in range(0, num_segs_for_cp):
                 global_start = last_token
                 global_end = cum_query_lens[i].item()
@@ -382,33 +400,37 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                 req_local_start = max(global_start, local_start)
                 req_local_end = min(global_end, local_end_with_pad)
                 num_local_tokens = req_local_end - req_local_start
+                
+                if not seg_is_skip[i] and num_local_tokens > 0:
+                    num_non_skip_tokens_local += num_local_tokens
+                print(f'==========num_non_skip_tokens_local:{num_non_skip_tokens_local}')
 
                 if num_local_tokens > 0:
                     cum += num_local_tokens
                     actual_seq_lengths_query[i] = cum
 
-                    if has_skip_info:
-                        r = int(seg_to_req[i])
-                        tokens_on_prev_devices = max(0, local_start - global_start)
-                        if not seg_is_skip[i]:
-                            # noskip segment sees: computed + skip_part + prev_noskip + local_noskip
-                            actual_seq_lengths_key[i] = (
-                                int(li_num_computed_tokens[r])
-                                + int(li_skip_query_lens[r])
-                                + tokens_on_prev_devices
-                                + num_local_tokens
-                            )
-                        else:
-                            # skip segment sees: computed + prev_skip + local_skip
-                            actual_seq_lengths_key[i] = (
-                                int(li_num_computed_tokens[r])
-                                + tokens_on_prev_devices
-                                + num_local_tokens
-                            )
-                    else:
+                    # if has_skip_info:
+                    #     r = int(seg_to_req[i])
+                    #     tokens_on_prev_devices = max(0, local_start - global_start)
+                    #     if not seg_is_skip[i]:
+                    #         # noskip segment sees: computed + skip_part + prev_noskip + local_noskip
+                    #         actual_seq_lengths_key[i] = (
+                    #             int(li_num_computed_tokens[r])
+                    #             + int(li_skip_query_lens[r])
+                    #             + tokens_on_prev_devices
+                    #             + num_local_tokens
+                    #         )
+                    #     else:
+                    #         # skip segment sees: computed + prev_skip + local_skip
+                    #         actual_seq_lengths_key[i] = (
+                    #             int(li_num_computed_tokens[r])
+                    #             + tokens_on_prev_devices
+                    #             + num_local_tokens
+                    #         )
+                    # else:
                         # Original dsa_cp logic (no skip)
-                        offset = global_end - req_local_end
-                        actual_seq_lengths_key[i] = seq_lens[i].item() - offset
+                    offset = global_end - req_local_end
+                    actual_seq_lengths_key[i] = seq_lens[i].item() - offset
                 else:
                     actual_seq_lengths_query[i] = cum
                     actual_seq_lengths_key[i] = 0
@@ -451,7 +473,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             dsa_cp_context=dsa_cp_context,
             num_actual_seqs = num_reqs,
             top_k_indices_skip_li_query = top_k_indices_of_skipped_queries_numpy,
-            non_skip_num_actual_tokens = num_of_non_skip_tokens,
+            non_skip_num_actual_tokens = num_non_skip_tokens_local,
             skip = skip
         )
 
