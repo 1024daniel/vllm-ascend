@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, TypeVar
+import numpy as np
 
 import scipy  # type: ignore
 import torch
@@ -359,7 +360,6 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             else:
                 actual_seq_lengths_query = self.actual_seq_lengths_query
                 actual_seq_lengths_key = self.actual_seq_lengths_key
-            import numpy as np
             seg_is_skip = np.zeros(num_segs_for_cp, dtype=bool)
             seg_is_skip[num_reqs:] = True
 
