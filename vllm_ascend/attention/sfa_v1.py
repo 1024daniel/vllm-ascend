@@ -310,8 +310,8 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         # key_lens computation.
         # ====================================================================
         dsa_cp_context = None
-        num_non_skip_tokens_local = 0
         if self.enable_dsa_cp:
+            num_of_non_skip_tokens = 0
             num_segs_for_cp = cum_query_lens.shape[0]
 
             global_tp_size = get_tp_group().world_size
@@ -375,7 +375,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                 num_local_tokens = req_local_end - req_local_start
                 
                 if not seg_is_skip[i] and num_local_tokens > 0:
-                    num_non_skip_tokens_local += num_local_tokens
+                    num_of_non_skip_tokens += num_local_tokens
 
                 if num_local_tokens > 0:
                     cum += num_local_tokens
