@@ -1251,7 +1251,7 @@ def enable_lightning_indexer_skip() -> bool:
     from vllm.config import get_current_vllm_config
 
     vllm_config = get_current_vllm_config()
-    is_ds_v32 = hasattr(vllm_config.model_config, "hf_text_config") and hasattr(
+    has_index_topk = hasattr(vllm_config.model_config, "hf_text_config") and hasattr(
         vllm_config.model_config.hf_text_config, "index_topk"
     )
-    return bool(is_ds_v32 and vllm_config.additional_config.get("enable_lightning_indexer_skip", False))
+    return bool(has_index_topk and vllm_config.additional_config.get("enable_lightning_indexer_skip", True) and vllm_config.model_config.enforce_eager)
