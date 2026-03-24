@@ -358,7 +358,7 @@ def get_sfa_skip_indices(num_comptuted_tokens, query_lens):
     num_skip_tokens = np.maximum(skip_threold - num_comptuted_tokens, 0)
     skip_query_lens = np.minimum(num_skip_tokens, query_lens)
     # if no request is skipped, return None
-    if np.sum(num_skip_tokens) == 0:
+    if np.sum(skip_query_lens) == 0:
         return None, None, None, None, None
 
     # calculate query lens for non-skip part

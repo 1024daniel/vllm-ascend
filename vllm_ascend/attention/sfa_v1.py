@@ -268,9 +268,9 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
              li_skiped_query_mask, num_of_non_skip_tokens) = get_sfa_skip_indices(
                 seq_lens-tokens, tokens
             )
-            skip = num_of_non_skip_tokens is not None
 
             if li_reorder_indices is not None:
+                skip = True
                 li_reorder_indices = torch.from_numpy(li_reorder_indices).pin_memory().to(dtype=torch.int32, device=self.device, non_blocking=True)
                 top_k_indices_of_skipped_queries_numpy = get_index_of_skipped_queries_numpy(
                     li_cum_query_lens, li_seq_lens, num_reqs, 2048
