@@ -421,7 +421,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             dsa_cp_context=dsa_cp_context,
             num_actual_seqs = num_reqs,
             top_k_indices_skip_li_query = top_k_indices_of_skipped_queries_numpy,
-            non_skip_num_actual_tokens = num_non_skip_tokens_local,
+            non_skip_num_actual_tokens = num_of_non_skip_tokens,
             skip = skip
         )
 
