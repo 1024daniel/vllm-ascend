@@ -263,7 +263,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         num_of_non_skip_tokens = 0
         skip = False
         top_k_indices_of_skipped_queries_numpy = None
-        if enable_lightning_indexer_skip() and common_attn_metadata.lightning_indexer_metadata  is None:
+        if enable_lightning_indexer_skip():
 
             (li_reorder_indices, li_cum_query_lens, li_seq_lens,
              li_skiped_query_mask, num_of_non_skip_tokens) = get_sfa_skip_indices(
