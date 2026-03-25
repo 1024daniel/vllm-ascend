@@ -124,11 +124,6 @@ class AscendPrefillContextParallelMetadata:
 @dataclass
 class AscendLightningIndexerMetadata:
     li_reorder_indices: torch.Tensor = None
-    li_cum_query_lens: torch.Tensor = None
-    li_seq_lens: torch.Tensor = None
-    li_skip_request_mask: torch.Tensor = None
-    top_k_indices_of_skipped_queries: torch.Tensor = None
-    num_of_non_skip_tokens: int = 0
 
 @dataclass
 class AscendCommonAttentionMetadata(CommonAttentionMetadata):
