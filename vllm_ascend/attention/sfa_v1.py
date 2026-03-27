@@ -1,7 +1,6 @@
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, TypeVar
 
-import numpy as np
 import scipy  # type: ignore
 import torch
 import torch_npu
@@ -56,7 +55,6 @@ from vllm_ascend.utils import (
     enable_dsa_cp,
     enable_dsa_cp_with_layer_shard,
     enable_dsa_cp_with_o_proj_tp,
-    enable_lightning_indexer_skip,
     get_weight_prefetch_method,
     maybe_trans_nz,
 )
@@ -209,7 +207,6 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         self.actual_seq_lengths_query = torch.zeros(max_num_reqs + 1, dtype=torch.int32, device=device)
         self.actual_seq_lengths_key = torch.empty_like(self.actual_seq_lengths_query)
 
-        self.enable_lightning_indexer_skip = enable_lightning_indexer_skip()
         self.index_of_skipped_queries = None
         self.num_actual_seqs = max_num_reqs
 
@@ -259,6 +256,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         # separate requests at the end. Updates cum_query_lens, seq_lens,
         # block_table, slot_mapping, cos, sin.
         # ====================================================================
+        self.enable_lightning_indexer_skip = common_attn_metadata.attn_state is not AscendAttentionState.DecodeOnly
         num_of_non_skip_tokens = 0
         skip = False
         top_k_indices_of_skipped_queries_numpy = None
@@ -274,9 +272,6 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                     torch.from_numpy(li_reorder_indices)
                     .pin_memory()
                     .to(dtype=torch.int32, device=self.device, non_blocking=True)
-                )
-                top_k_indices_of_skipped_queries_numpy = get_index_of_skipped_queries_numpy(
-                    li_cum_query_lens, li_seq_lens, num_reqs, 2048
                 )
                 li_cum_query_lens = (
                     torch.from_numpy(li_cum_query_lens)
@@ -363,8 +358,6 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             else:
                 actual_seq_lengths_query = self.actual_seq_lengths_query
                 actual_seq_lengths_key = self.actual_seq_lengths_key
-            seg_is_skip = np.zeros(num_segs, dtype=bool)
-            seg_is_skip[num_reqs:] = True
 
             last_token = 0
             cum = 0
@@ -377,7 +370,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                 req_local_end = min(global_end, local_end_with_pad)
                 num_local_tokens = req_local_end - req_local_start
 
-                if not seg_is_skip[i] and num_local_tokens > 0:
+                if i < num_reqs and num_local_tokens > 0:
                     num_of_non_skip_tokens += num_local_tokens
 
                 if num_local_tokens > 0:
@@ -407,6 +400,15 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             top_k_indices_of_skipped_queries_numpy = get_index_of_skipped_queries_numpy(
                 actual_seq_lengths_query, actual_seq_lengths_key, num_reqs, 2048
             )
+        if self.enable_lightning_indexer_skip:
+            if self.enable_dsa_cp:
+                top_k_indices_of_skipped_queries_numpy = get_index_of_skipped_queries_numpy(
+                    actual_seq_lengths_query, actual_seq_lengths_key, num_reqs, 2048
+                )
+            else:
+                top_k_indices_of_skipped_queries_numpy = get_index_of_skipped_queries_numpy(
+                    cum_query_lens, seq_lens, num_reqs, 2048
+                )
         top_k_indices_of_skipped_queries_numpy = (
             torch.from_numpy(top_k_indices_of_skipped_queries_numpy)
             .pin_memory()
@@ -540,7 +542,6 @@ class AscendSFAImpl(MLAAttentionImpl):
         if self.use_sparse_c8_indexer:
             self.c8_k_cache_dtype = torch.int8
             self.c8_k_scale_cache_dtype = torch.float16
-        self.enable_lightning_indexer_skip = enable_lightning_indexer_skip()
 
         # Effective in SFA when FlashComm is enabled.
         self.enable_dsa_cp = enable_dsa_cp()
